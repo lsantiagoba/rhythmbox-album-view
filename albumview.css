@@ -1,0 +1,15 @@
+.album-view-root { background: @theme_base_color; }
+.album-view-header { padding: 18px 24px 12px 24px; }
+.album-view-title { font-size: 26px; font-weight: 700; }
+.album-card { padding: 8px; border-radius: 10px; }
+.album-card:hover { background: alpha(@theme_fg_color, 0.07); }
+.album-cover { border-radius: 8px; background: alpha(@theme_fg_color, 0.08); }
+.album-card-title { font-weight: 600; }
+.album-card-artist { color: alpha(@theme_fg_color, 0.66); }
+.album-detail-hero { padding: 28px 34px 26px 26px; }
+.album-detail-kind { font-size: 11px; font-weight: 700; color: alpha(@theme_fg_color, 0.6); }
+.album-detail-title { font-size: 30px; font-weight: 700; }
+.album-detail-artist { font-size: 16px; font-weight: 600; }
+.album-track-list { margin: 0 34px 30px 34px; border-radius: 8px; }
+.album-track-title { font-weight: 500; }
+

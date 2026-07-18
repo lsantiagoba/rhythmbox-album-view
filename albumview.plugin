@@ -1,0 +1,10 @@
+[Plugin]
+Loader=python3
+Module=albumview
+IAge=3
+Name=Album View
+Description=Browse your library as a beautiful album grid with cover art and playback controls
+Authors=Album View contributors
+Copyright=Copyright © 2026 Album View contributors
+Website=https://github.com/
+
