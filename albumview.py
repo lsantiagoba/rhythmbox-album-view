@@ -16,7 +16,7 @@ from gi.repository import Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Peas, RB
 UNKNOWN_ALBUM = "Unknown Album"
 UNKNOWN_ARTIST = "Unknown Artist"
 COVER_SIZE = 176
-MAX_ART_REQUESTS = 4
+ALBUMS_PER_PAGE = 80
 
 
 def text(entry, prop, fallback=""):
@@ -45,13 +45,11 @@ class AlbumViewSource(RB.Source):
         self._filtered = []
         self._selected = None
         self._art_store = RB.ExtDB(name="album-art")
-        self._art_requests = {}
-        self._art_pending = []
-        self._art_inflight = 0
         self._art_generation = 0
         self._db_handlers = []
         self._search_id = 0
         self._last_query = None
+        self._page = 0
         self._build_ui()
 
     def do_selected(self):
@@ -107,7 +105,27 @@ class AlbumViewSource(RB.Source):
         self.flow.set_margin_top(20)
         self.flow.set_margin_bottom(30)
         grid_scroll.add(self.flow)
-        self.stack.add_named(grid_scroll, "grid")
+
+        grid_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        grid_page.pack_start(grid_scroll, True, True, 0)
+        pager = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        pager.set_halign(Gtk.Align.CENTER)
+        pager.set_margin_top(8)
+        pager.set_margin_bottom(12)
+        self.page_previous = Gtk.Button.new_from_icon_name(
+            "go-previous-symbolic", Gtk.IconSize.BUTTON)
+        self.page_previous.set_tooltip_text("Previous albums")
+        self.page_previous.connect("clicked", self._previous_page)
+        self.page_label = Gtk.Label()
+        self.page_next = Gtk.Button.new_from_icon_name(
+            "go-next-symbolic", Gtk.IconSize.BUTTON)
+        self.page_next.set_tooltip_text("Next albums")
+        self.page_next.connect("clicked", self._next_page)
+        pager.pack_start(self.page_previous, False, False, 0)
+        pager.pack_start(self.page_label, False, False, 0)
+        pager.pack_start(self.page_next, False, False, 0)
+        grid_page.pack_start(pager, False, False, 0)
+        self.stack.add_named(grid_page, "grid")
 
         self.detail_scroll = Gtk.ScrolledWindow()
         self.detail_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -130,6 +148,9 @@ class AlbumViewSource(RB.Source):
         if self._search_id:
             GLib.source_remove(self._search_id)
             self._search_id = 0
+        if getattr(self, "_reload_id", 0):
+            GLib.source_remove(self._reload_id)
+            self._reload_id = 0
         db = self.props.shell.props.db
         for handler in self._db_handlers:
             db.disconnect(handler)
@@ -188,8 +209,19 @@ class AlbumViewSource(RB.Source):
         self._last_query = query
         self._filtered = [a for a in self._albums
                           if not query or query in a["title"].casefold() or query in a["artist"].casefold()]
+        self._page = 0
         self._render_grid()
         return GLib.SOURCE_REMOVE
+
+    def _previous_page(self, _button=None):
+        if self._page > 0:
+            self._page -= 1
+            self._render_grid()
+
+    def _next_page(self, _button=None):
+        if (self._page + 1) * ALBUMS_PER_PAGE < len(self._filtered):
+            self._page += 1
+            self._render_grid()
 
     def _clear_container(self, container):
         for child in container.get_children():
@@ -197,15 +229,20 @@ class AlbumViewSource(RB.Source):
 
     def _render_grid(self):
         self._clear_container(self.flow)
-        self._art_requests.clear()
-        self._art_pending.clear()
-        self._art_inflight = 0
         self._art_generation += 1
         if not self._filtered:
             empty = Gtk.Label(label="No albums found", margin_top=60)
             empty.get_style_context().add_class("dim-label")
             self.flow.add(empty)
-        for album in self._filtered:
+        page_count = max(1, (len(self._filtered) + ALBUMS_PER_PAGE - 1) // ALBUMS_PER_PAGE)
+        self._page = min(self._page, page_count - 1)
+        start = self._page * ALBUMS_PER_PAGE
+        end = start + ALBUMS_PER_PAGE
+        self.page_label.set_text("Page %d of %d · %d albums" % (
+            self._page + 1, page_count, len(self._filtered)))
+        self.page_previous.set_sensitive(self._page > 0)
+        self.page_next.set_sensitive(end < len(self._filtered))
+        for album in self._filtered[start:end]:
             cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             cell.set_halign(Gtk.Align.START)
             cell.set_valign(Gtk.Align.START)
@@ -239,59 +276,47 @@ class AlbumViewSource(RB.Source):
         image.set_pixel_size(size)
         image.set_size_request(size, size)
         image.get_style_context().add_class("album-cover")
-        cached_art = album.get("art_pixbuf")
-        if cached_art is not None:
-            scaled = cached_art.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
-            image.set_from_pixbuf(scaled)
-            return image
         entry = album["tracks"][0]
         key = entry.create_ext_db_key(RB.RhythmDBPropType.ALBUM)
-        token = id(image)
-        self._art_requests[token] = image
         generation = self._art_generation
 
-        def art_ready(_key, _store_key, filename, pixbuf, request_token=token):
-            target = self._art_requests.get(request_token)
-            if target is not None:
+        # ExtDB.request() does much more than read the artwork cache: on a
+        # miss it starts every art-search provider, including a new GStreamer
+        # Discoverer.  Calling it for every grid card exhausts file
+        # descriptors and several gigabytes of memory on a large library.
+        # Grid cards therefore use the synchronous, cache-only lookup.
+        try:
+            filename, _store_key = self._art_store.lookup(key)
+            if filename:
+                art = GdkPixbuf.Pixbuf.new_from_file_at_scale(filename, size, size, True)
+                image.set_from_pixbuf(art)
+                return image
+        except (GLib.Error, TypeError, AttributeError):
+            pass
+
+        if not priority:
+            return image
+
+        # An explicit detail view may fetch one missing cover.  Guard the
+        # callback because the user can leave the page while it is running.
+        def art_ready(_key, _store_key, filename, pixbuf):
+            if generation == self._art_generation and image.get_parent() is not None:
                 try:
                     art = pixbuf
                     if art is None and filename:
-                        art = GdkPixbuf.Pixbuf.new_from_file(filename)
+                        art = GdkPixbuf.Pixbuf.new_from_file_at_scale(filename, size, size, True)
+                    elif art is not None:
+                        art = art.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
                     if art is not None:
-                        album["art_pixbuf"] = art
-                        scaled = art.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR)
-                        target.set_from_pixbuf(scaled)
+                        image.set_from_pixbuf(art)
                 except (GLib.Error, TypeError, AttributeError):
                     pass
-            if generation == self._art_generation:
-                self._art_inflight = max(0, self._art_inflight - 1)
-                self._pump_art_requests()
 
-        if priority:
-            # A selected album should load immediately without cancelling the
-            # grid's existing queue.  This temporarily permits one extra
-            # request beyond the normal concurrency limit.
-            self._art_inflight += 1
-            try:
-                self._art_store.request(key, art_ready)
-            except (GLib.Error, TypeError, AttributeError):
-                self._art_inflight = max(0, self._art_inflight - 1)
-        else:
-            self._art_pending.append((key, art_ready, generation))
-            self._pump_art_requests()
+        try:
+            self._art_store.request(key, art_ready)
+        except (GLib.Error, TypeError, AttributeError):
+            pass
         return image
-
-    def _pump_art_requests(self):
-        """Keep artsearch from exhausting file descriptors on large libraries."""
-        while self._art_pending and self._art_inflight < MAX_ART_REQUESTS:
-            key, callback, generation = self._art_pending.pop(0)
-            if generation != self._art_generation:
-                continue
-            self._art_inflight += 1
-            try:
-                self._art_store.request(key, callback)
-            except (GLib.Error, TypeError, AttributeError):
-                self._art_inflight = max(0, self._art_inflight - 1)
 
     def _show_album(self, album):
         self._selected = album
@@ -447,7 +472,9 @@ class AlbumViewPlugin(GObject.Object, Peas.Activatable):
         album_iter = find_page(model.get_iter_first(), self.source)
         if music_iter and album_iter:
             next_iter = model.iter_next(music_iter)
-            if next_iter:
+            # DisplayPageModel is not a Gtk.TreeStore on all Rhythmbox
+            # versions (3.4.9 has no move_before method).
+            if next_iter and hasattr(model, "move_before"):
                 model.move_before(album_iter, next_iter)
         return GLib.SOURCE_REMOVE
 
